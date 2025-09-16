@@ -20,7 +20,7 @@ python train.py
 
 Implementation of SAC algorithm for continuous action spaces.
 
-📖 **Documentation**: [sac-design.md](./sac2/sac-design.md)
+📖 **Documentation**: [sac-design.md](./sac2/sac2-design.md)
 
 **Usage**:
 ```bash
