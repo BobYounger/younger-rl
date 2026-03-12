@@ -34,6 +34,9 @@ class RolloutBuffer:
         self.actions = np.zeros((self.capacity, *action_shape), dtype=self.action_dtype)
         self.rewards = np.zeros((self.capacity,), dtype=np.float32)
         self.dones = np.zeros((self.capacity,), dtype=np.float32)
+        # episode_ends = terminated OR truncated; used to stop GAE accumulation at
+        # episode boundaries so truncated trajectories don't bleed into the next episode.
+        self.episode_ends = np.zeros((self.capacity,), dtype=np.float32)
         self.values = np.zeros((self.capacity,), dtype=np.float32)
         self.next_values = np.zeros((self.capacity,), dtype=np.float32)
         self.log_probs = np.zeros((self.capacity,), dtype=np.float32)
@@ -60,6 +63,7 @@ class RolloutBuffer:
         action,
         reward: float,
         done: bool | float,
+        episode_end: bool | float,
         value: float,
         next_value: float,
         log_prob: float,
@@ -72,6 +76,7 @@ class RolloutBuffer:
         self.actions[idx] = np.asarray(action, dtype=self.action_dtype).reshape(self.action_shape)
         self.rewards[idx] = float(reward)
         self.dones[idx] = float(done)
+        self.episode_ends[idx] = float(episode_end)
         self.values[idx] = float(value)
         self.next_values[idx] = float(next_value)
         self.log_probs[idx] = float(log_prob)
@@ -87,9 +92,13 @@ class RolloutBuffer:
         gae = 0.0
 
         for t in reversed(range(size)):
+            # non_terminal: 0 only for truly terminated steps; controls per-step bootstrap.
             non_terminal = 1.0 - self.dones[t]
+            # non_episode_end: 0 for both terminated AND truncated; stops GAE accumulation
+            # across episode boundaries so truncated trajectories don't bleed into the next.
+            non_episode_end = 1.0 - self.episode_ends[t]
             delta = self.rewards[t] + self.gamma * self.next_values[t] * non_terminal - self.values[t]
-            gae = delta + self.gamma * self.gae_lambda * non_terminal * gae
+            gae = delta + self.gamma * self.gae_lambda * non_episode_end * gae
             advantages[t] = gae
 
         self.advantages[:size] = advantages

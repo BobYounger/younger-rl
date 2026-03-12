@@ -79,8 +79,10 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
             normalized_obs = normalize_observation(obs, obs_normalizer, config.normalize_observations)
             action, log_prob, value = agent.act(normalized_obs)
             next_obs, reward, terminated, truncated, _ = env.step(action.astype(np.float32))
-            obs_normalizer.update(next_obs)
+            # Normalize BEFORE updating stats to avoid using contaminated statistics
+            # for the bootstrap value of the same step.
             normalized_next_obs = normalize_observation(next_obs, obs_normalizer, config.normalize_observations)
+            obs_normalizer.update(next_obs)
             next_value = 0.0 if terminated else agent.predict_value(normalized_next_obs)
             episode_end = terminated or truncated
 
@@ -89,6 +91,7 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
                 action=np.asarray(action, dtype=np.float32),
                 reward=float(reward) * config.reward_scale,
                 done=float(terminated),
+                episode_end=float(episode_end),
                 value=value,
                 next_value=next_value,
                 log_prob=log_prob,

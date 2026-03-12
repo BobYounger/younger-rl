@@ -152,7 +152,7 @@ class PPOContinuousAgent:
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    approx_kl = (mb_old_log_probs - new_log_probs).mean().abs()
 
                 policy_loss_total += float(policy_loss.item())
                 value_loss_total += float(value_loss.item())
