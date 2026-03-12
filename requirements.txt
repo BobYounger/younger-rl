@@ -4,3 +4,4 @@ imageio
 pillow
 matplotlib
 gymnasium
+stable-baselines3
