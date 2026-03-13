@@ -16,6 +16,22 @@ Run:
 ./.venv/bin/python baselines/sb3/ppo_pendulum.py --env Pendulum-v1 --device cpu --run-name sb3-ppo-pendulum
 ```
 
+## SAC on Pendulum
+
+Run:
+
+```bash
+./.venv/bin/python baselines/sb3/sac_pendulum.py --env Pendulum-v1 --device cpu --run-name sb3-sac-pendulum
+```
+
+## DDPG on Pendulum
+
+Run:
+
+```bash
+./.venv/bin/python baselines/sb3/ddpg_pendulum.py --env Pendulum-v1 --device cpu --run-name sb3-ddpg-pendulum
+```
+
 Outputs are written to:
 
 ```bash
