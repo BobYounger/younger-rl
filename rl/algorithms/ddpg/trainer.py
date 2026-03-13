@@ -9,15 +9,15 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import numpy as np
 from gymnasium.spaces import Box
 
-from rl.buffers import RolloutBuffer
+from rl.buffers import ReplayBuffer
 from rl.common import MetricLogger, RunningMeanStd, save_checkpoint, set_seed, setup_logging
 from rl.envs import make_env
 
-from .agent import PPOContinuousAgent
-from .config import PPOContinuousConfig
+from .agent import DDPGAgent
+from .config import DDPGConfig
 
 
-def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
+def train_ddpg(config: DDPGConfig) -> Dict[str, float]:
     set_seed(config.seed)
     env = make_env(config.env_id, seed=config.seed)
 
@@ -30,27 +30,25 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
     obs_shape = env.observation_space.shape
     action_low = env.action_space.low.astype(np.float32)
     action_high = env.action_space.high.astype(np.float32)
-    obs_normalizer = RunningMeanStd(obs_shape)
 
-    agent = PPOContinuousAgent(
+    obs_normalizer = RunningMeanStd(obs_shape)
+    agent = DDPGAgent(
         obs_dim=obs_dim,
         action_dim=action_dim,
         action_low=action_low,
         action_high=action_high,
         config=config,
     )
-    rollout_buffer = RolloutBuffer(
+    replay_buffer = ReplayBuffer(
         obs_shape=obs_dim,
-        capacity=config.rollout_steps,
+        capacity=config.replay_size,
         action_shape=action_dim,
-        device=config.device,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
         action_dtype=np.float32,
+        device=config.device,
     )
 
-    run_name = config.run_name or f"ppo-{config.env_id.lower()}-seed{config.seed}"
-    runtime_logger = setup_logging(config.run_dir, run_name=run_name, logger_name=f"ppo.{run_name}", console=True)
+    run_name = config.run_name or f"ddpg-{config.env_id.lower()}-seed{config.seed}"
+    runtime_logger = setup_logging(config.run_dir, run_name=run_name, logger_name=f"ddpg.{run_name}", console=True)
     metrics_logger = MetricLogger(config.run_dir, run_name=run_name)
     config_path = metrics_logger.save_config(asdict(config))
     run_dir = metrics_logger.log_dir
@@ -64,64 +62,59 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
     eval_returns: list[float] = []
     best_eval_return = float("-inf")
     best_checkpoint_path: Path | None = None
+    last_update_metrics = {
+        "actor_loss": float("nan"),
+        "critic_loss": float("nan"),
+        "q_mean": float("nan"),
+        "target_q_mean": float("nan"),
+    }
 
-    last_update_metrics: Dict[str, float] = {}
-    total_steps = 0
+    for step in range(1, config.total_steps + 1):
+        normalized_obs = normalize_observation(obs, obs_normalizer, config.normalize_observations)
+        action = agent.act(normalized_obs, deterministic=False)
+        next_obs, reward, terminated, truncated, _ = env.step(action.astype(np.float32))
+        normalized_next_obs = normalize_observation(next_obs, obs_normalizer, config.normalize_observations)
+        obs_normalizer.update(next_obs)
+        done = terminated or truncated
 
-    for update in range(1, config.num_updates + 1):
-        rollout_buffer.reset()
+        replay_buffer.add(
+            obs=np.asarray(normalized_obs, dtype=np.float32),
+            action=np.asarray(action, dtype=np.float32),
+            reward=float(reward) * config.reward_scale,
+            next_obs=np.asarray(normalized_next_obs, dtype=np.float32),
+            done=float(terminated),
+        )
 
-        for _ in range(config.rollout_steps):
-            normalized_obs = normalize_observation(obs, obs_normalizer, config.normalize_observations)
-            action, log_prob, value = agent.act(normalized_obs)
-            next_obs, reward, terminated, truncated, _ = env.step(action.astype(np.float32))
-            # Normalize BEFORE updating stats to avoid using contaminated statistics
-            # for the bootstrap value of the same step.
-            normalized_next_obs = normalize_observation(next_obs, obs_normalizer, config.normalize_observations)
-            obs_normalizer.update(next_obs)
-            next_value = 0.0 if terminated else agent.predict_value(normalized_next_obs)
-            episode_end = terminated or truncated
+        episode_return += float(reward)
+        episode_length += 1
 
-            rollout_buffer.add(
-                obs=np.asarray(normalized_obs, dtype=np.float32),
-                action=np.asarray(action, dtype=np.float32),
-                reward=float(reward) * config.reward_scale,
-                done=float(terminated),
-                episode_end=float(episode_end),
-                value=value,
-                next_value=next_value,
-                log_prob=log_prob,
+        if step >= config.learning_starts and step % config.train_frequency == 0:
+            update_metrics = []
+            for _ in range(config.gradient_steps):
+                batch = replay_buffer.sample(config.batch_size)
+                update_metrics.append(agent.update(batch))
+            last_update_metrics = _aggregate_metrics(update_metrics)
+
+        if done:
+            completed_returns.append(episode_return)
+            runtime_logger.info(
+                "episode done | return=%.3f | length=%d | total_steps=%d",
+                episode_return,
+                episode_length,
+                step,
             )
+            obs, _ = env.reset()
+            episode_return = 0.0
+            episode_length = 0
+        else:
+            obs = next_obs
 
-            episode_return += float(reward)
-            episode_length += 1
-            total_steps += 1
-
-            if episode_end:
-                completed_returns.append(episode_return)
-                runtime_logger.info(
-                    "episode done | return=%.3f | length=%d | total_steps=%d",
-                    episode_return,
-                    episode_length,
-                    total_steps,
-                )
-                obs, _ = env.reset()
-                episode_return = 0.0
-                episode_length = 0
-            else:
-                obs = next_obs
-
-        rollout_buffer.finish_path()
-        batch = rollout_buffer.get(normalize_advantages=True)
-        last_update_metrics = agent.update(batch)
-
-        mean_return = float(np.mean(completed_returns[-10:])) if completed_returns else float("nan")
         eval_return = float("nan")
-        if update % config.eval_interval == 0:
+        if step % config.eval_interval == 0:
             eval_return = evaluate_policy(
                 agent=agent,
                 env_id=config.env_id,
-                seed=config.seed + update,
+                seed=config.seed + step,
                 episodes=config.eval_episodes,
                 obs_normalizer=obs_normalizer,
                 normalize_observations=config.normalize_observations,
@@ -131,47 +124,51 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
                 best_eval_return = eval_return
                 best_checkpoint_path = save_checkpoint(
                     run_dir / "best_checkpoint.pt",
-                    model=agent.model,
-                    optimizer=agent.optimizer,
-                    step=total_steps,
+                    model=agent.actor,
+                    optimizer=agent.actor_optimizer,
+                    step=step,
                     extra={
                         "config_path": str(config_path),
+                        "agent_state": agent.state_dict(),
                         "obs_normalizer": obs_normalizer.state_dict(),
                         "best_eval_return": best_eval_return,
                     },
                 )
-        metrics = {
-            "update": update,
-            "total_steps": total_steps,
-            "episode_return_mean_10": mean_return,
-            "eval_return": eval_return,
-            **last_update_metrics,
-        }
-        metrics_history.append(metrics)
-        metrics_logger.log_metrics(metrics, step=total_steps, stdout=False)
 
-        if update % config.log_interval == 0:
+        if step % config.log_interval == 0 or step == config.total_steps:
+            mean_return = float(np.mean(completed_returns[-10:])) if completed_returns else float("nan")
+            metrics = {
+                "total_steps": step,
+                "episode_return_mean_10": mean_return,
+                "eval_return": eval_return,
+                **last_update_metrics,
+            }
+            metrics_history.append(metrics)
+            metrics_logger.log_metrics(metrics, step=step, stdout=False)
             runtime_logger.info(
-                "update=%d | steps=%d | return10=%.3f | pi=%.4f | v=%.4f | kl=%.5f",
-                update,
-                total_steps,
+                "steps=%d | return10=%.3f | actor=%.4f | critic=%.4f | q=%.4f",
+                step,
                 mean_return,
-                last_update_metrics["policy_loss"],
-                last_update_metrics["value_loss"],
-                last_update_metrics["approx_kl"],
+                last_update_metrics["actor_loss"],
+                last_update_metrics["critic_loss"],
+                last_update_metrics["q_mean"],
             )
-            if update % config.eval_interval == 0:
+            if step % config.eval_interval == 0:
                 runtime_logger.info("eval | episodes=%d | return=%.3f", config.eval_episodes, eval_return)
 
     env.close()
     checkpoint_path = save_checkpoint(
         run_dir / "checkpoint.pt",
-        model=agent.model,
-        optimizer=agent.optimizer,
-        step=total_steps,
-        extra={"config_path": str(config_path), "obs_normalizer": obs_normalizer.state_dict()},
+        model=agent.actor,
+        optimizer=agent.actor_optimizer,
+        step=config.total_steps,
+        extra={
+            "config_path": str(config_path),
+            "agent_state": agent.state_dict(),
+            "obs_normalizer": obs_normalizer.state_dict(),
+        },
     )
-    if config.plot_metrics:
+    if config.plot_metrics and metrics_history:
         plot_training_curves(metrics_history, run_dir / "training_curves.png")
     if config.save_gif:
         record_policy_gif(
@@ -184,8 +181,9 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
             obs_normalizer=obs_normalizer,
             normalize_observations=config.normalize_observations,
         )
+
     summary = {
-        "total_steps": float(total_steps),
+        "total_steps": float(config.total_steps),
         "episode_return_mean_10": float(np.mean(completed_returns[-10:])) if completed_returns else float("nan"),
         "eval_return": float(np.mean(eval_returns[-3:])) if eval_returns else float("nan"),
         "best_eval_return": float(best_eval_return) if eval_returns else float("nan"),
@@ -198,7 +196,7 @@ def train_ppo_continuous(config: PPOContinuousConfig) -> Dict[str, float]:
 
 
 def evaluate_policy(
-    agent: PPOContinuousAgent,
+    agent: DDPGAgent,
     env_id: str,
     seed: int,
     episodes: int = 5,
@@ -214,7 +212,7 @@ def evaluate_policy(
             episode_return = 0.0
             while not done:
                 normalized_obs = normalize_observation(obs, obs_normalizer, normalize_observations)
-                action, _, _ = agent.act(normalized_obs, deterministic=True)
+                action = agent.act(normalized_obs, deterministic=True)
                 obs, reward, terminated, truncated, _ = env.step(action.astype(np.float32))
                 episode_return += float(reward)
                 done = terminated or truncated
@@ -236,9 +234,6 @@ def normalize_observation(
 
 
 def plot_training_curves(metrics_history: list[Dict[str, float]], output_path: str | Path) -> Path:
-    if not metrics_history:
-        raise ValueError("metrics_history is empty.")
-
     import matplotlib
 
     matplotlib.use("Agg")
@@ -249,17 +244,17 @@ def plot_training_curves(metrics_history: list[Dict[str, float]], output_path: s
 
     steps = [row["total_steps"] for row in metrics_history]
     returns = [row["episode_return_mean_10"] for row in metrics_history]
-    policy_losses = [row["policy_loss"] for row in metrics_history]
-    value_losses = [row["value_loss"] for row in metrics_history]
-    kls = [row["approx_kl"] for row in metrics_history]
+    actor_losses = [row["actor_loss"] for row in metrics_history]
+    critic_losses = [row["critic_loss"] for row in metrics_history]
+    q_values = [row["q_mean"] for row in metrics_history]
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 7))
     axes = axes.flatten()
     plots = [
         ("Return(10)", returns),
-        ("Policy Loss", policy_losses),
-        ("Value Loss", value_losses),
-        ("Approx KL", kls),
+        ("Actor Loss", actor_losses),
+        ("Critic Loss", critic_losses),
+        ("Q Mean", q_values),
     ]
     for ax, (title, values) in zip(axes, plots):
         ax.plot(steps, values, linewidth=2.0)
@@ -273,7 +268,7 @@ def plot_training_curves(metrics_history: list[Dict[str, float]], output_path: s
 
 
 def record_policy_gif(
-    agent: PPOContinuousAgent,
+    agent: DDPGAgent,
     env_id: str,
     output_path: str | Path,
     seed: int = 0,
@@ -298,7 +293,7 @@ def record_policy_gif(
                 if frame is not None:
                     frames.append(frame)
                 normalized_obs = normalize_observation(obs, obs_normalizer, normalize_observations)
-                action, _, _ = agent.act(normalized_obs, deterministic=True)
+                action = agent.act(normalized_obs, deterministic=True)
                 obs, _, terminated, truncated, _ = env.step(action.astype(np.float32))
                 if terminated or truncated:
                     break
@@ -310,3 +305,8 @@ def record_policy_gif(
 
     imageio.mimsave(output_path, frames, fps=30, loop=0)
     return output_path
+
+
+def _aggregate_metrics(metrics: list[Dict[str, float]]) -> Dict[str, float]:
+    keys = metrics[0].keys()
+    return {key: float(np.mean([row[key] for row in metrics])) for key in keys}
